@@ -37,6 +37,8 @@ async function mockServices(
     loginFails?: boolean
     unavailable?: boolean
     expired?: boolean
+    profileDenied?: boolean
+    patchError?: { status: number; code: string }
   } = {},
 ) {
   let profile: typeof initialProfile | null = options.profileMissing ? null : { ...initialProfile }
@@ -62,7 +64,24 @@ async function mockServices(
     const body = request.postDataJSON() ?? {}
     requests.push({ path, body })
     if (options.inactive || options.unavailable || options.expired) {
-      await route.fulfill({ status: options.inactive ? 403 : options.expired ? 401 : 503, json: { error: { code: 'DENIED' } } })
+      await route.fulfill({
+        status: options.inactive ? 403 : options.expired ? 401 : 503,
+        json: { error: { code: options.inactive ? 'USER_INACTIVE' : options.expired ? 'INVALID_SESSION' : 'DEPENDENCY_UNAVAILABLE' } },
+      })
+      return
+    }
+    if (options.patchError && request.method() === 'PATCH') {
+      await route.fulfill({
+        status: options.patchError.status,
+        json: {
+          error: { code: options.patchError.code, message: 'private_message', details: 'private_details' },
+          requestId: 'test-request',
+        },
+      })
+      return
+    }
+    if (options.profileDenied && request.method() === 'GET' && path.endsWith('/me')) {
+      await route.fulfill({ status: 403, json: { error: { code: 'FORBIDDEN', message: 'private_message' }, requestId: 'test-request' } })
       return
     }
     if (path.endsWith('/me')) {
@@ -89,6 +108,35 @@ async function login(page: Page) {
   await page.getByLabel(/^Contraseña/).fill('Fuerte123!')
   await page.getByRole('button', { name: 'Iniciar sesión', exact: true }).click()
 }
+
+for (const [status, code, message] of [
+  [403, 'FORBIDDEN', 'Tu usuario no tiene acceso.'],
+  [404, 'NOT_FOUND', 'Recurso no encontrado.'],
+  [422, 'INVALID_INPUT', 'Revisa los datos del formulario.'],
+] as const) {
+  test(`CR-162: ${code} conserva el formulario sin mostrar detalles técnicos`, async ({ page }) => {
+    const requests = await mockServices(page, { patchError: { status, code } })
+    await login(page)
+    await page.getByLabel(/^Nombres/).fill('Anabel')
+    await page.getByRole('button', { name: 'Guardar cambios' }).click()
+    await expect(page.getByRole('alert')).toContainText(message)
+    await expect(page.getByLabel(/^Nombres/)).toHaveValue('Anabel')
+    await expect(page).toHaveURL(/\/cuenta$/)
+    await expect(page.locator('body')).not.toContainText('private_message')
+    await expect(page.locator('body')).not.toContainText('private_details')
+    expect(requests.some((request) => request.path.endsWith('/logout'))).toBe(false)
+  })
+}
+
+test('CR-162: un 403 de permisos oculta el perfil sin cerrar una sesión válida', async ({ page }) => {
+  const requests = await mockServices(page, { profileDenied: true })
+  await login(page)
+  await expect(page).toHaveURL(/\/cuenta$/)
+  await expect(page.getByRole('alert')).toContainText('Tu usuario no tiene acceso.')
+  await expect(page.getByLabel(/^Nombres/)).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Reintentar' })).toBeVisible()
+  expect(requests.some((request) => request.path.endsWith('/logout'))).toBe(false)
+})
 
 test('login, perfil persistido por API, recarga y cierre sin datos del simulador', async ({ page }) => {
   const requests = await mockServices(page)

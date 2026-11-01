@@ -1,5 +1,6 @@
 /* Supabase Auth real y API de perfil · ID01. © 2026 Equipo CuidaRed – INTEC. */
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
+import { collectionSearch, readPaginatedResponse, type CollectionQuery, type PaginatedResponse } from '../../lib/api-contract'
 
 export const STORAGE_KEY = 'cuidared.auth.real'
 let singleton: SupabaseClient | undefined
@@ -56,13 +57,15 @@ export function temporaryClient() {
 
 export class ApiError extends Error {
   status: number
-  constructor(status: number, message: string) {
+  code?: string
+  constructor(status: number, message: string, code?: string) {
     super(message)
     this.status = status
+    this.code = code
   }
 }
 
-export async function api<T>(path: string, token: string, method = 'GET', data?: unknown): Promise<T> {
+async function apiResponse(path: string, token: string, method = 'GET', data?: unknown): Promise<Response> {
   const { api: base } = configuration()
   const res = await fetch(`${base}/api/v1${path}`, {
     method,
@@ -73,21 +76,36 @@ export async function api<T>(path: string, token: string, method = 'GET', data?:
     signal: AbortSignal.timeout(15_000),
   })
   if (!res.ok) {
+    const body = await res.json().catch(() => null)
+    const code = typeof body?.error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(body.error.code) ? body.error.code : undefined
     const message =
       res.status === 401
         ? 'Tu sesión venció. Inicia sesión de nuevo.'
         : res.status === 403
           ? 'Tu usuario no tiene acceso.'
-          : res.status === 409
-            ? method === 'GET'
-              ? 'El perfil de tu invitación no está disponible. Contacta a la persona responsable.'
-              : 'No se pudo guardar el perfil con esos datos.'
-            : res.status === 422
-              ? 'Revisa los datos del formulario.'
-              : 'No se pudo conectar con CuidaRed. Intenta de nuevo.'
-    throw new ApiError(res.status, message)
+          : res.status === 404
+            ? 'Recurso no encontrado.'
+            : res.status === 409
+              ? method === 'GET'
+                ? 'El perfil de tu invitación no está disponible. Contacta a la persona responsable.'
+                : 'No se pudo guardar el perfil con esos datos.'
+              : res.status === 422
+                ? 'Revisa los datos del formulario.'
+                : 'No se pudo conectar con CuidaRed. Intenta de nuevo.'
+    throw new ApiError(res.status, message, code)
   }
+  return res
+}
+
+export async function api<T>(path: string, token: string, method = 'GET', data?: unknown): Promise<T> {
+  const res = await apiResponse(path, token, method, data)
   return res.status === 204 ? (undefined as T) : ((await res.json()).data as T)
+}
+
+export async function apiPage<T>(path: string, token: string, query: CollectionQuery = {}): Promise<PaginatedResponse<T>> {
+  if (path.includes('?') || path.includes('#')) throw new Error('La ruta del listado no debe contener parámetros.')
+  const res = await apiResponse(`${path}?${collectionSearch(query)}`, token)
+  return readPaginatedResponse<T>(await res.json())
 }
 
 export interface Profile {
